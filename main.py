@@ -11,18 +11,13 @@ def root():
     return {"status": "Nova Backend v2 Online"}
 
 def extract_frames(video_path, out_dir, count=6):
-    """Extract N frames từ video để gửi Gemini"""
     os.makedirs(out_dir, exist_ok=True)
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries",
-        "format=duration", "-of", "json", video_path
-    ]
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", video_path]
     r = subprocess.run(cmd, capture_output=True, text=True)
     try:
         duration = float(json.loads(r.stdout)["format"]["duration"])
     except:
         duration = 30.0
-
     interval = duration / (count + 1)
     frames = []
     for i in range(1, count + 1):
@@ -30,15 +25,11 @@ def extract_frames(video_path, out_dir, count=6):
         out_path = f"{out_dir}/frame_{i:02d}.jpg"
         subprocess.run([
             "ffmpeg", "-y", "-ss", str(t), "-i", video_path,
-            "-vframes", "1", "-q:v", "3",
-            "-vf", "scale=720:-1", out_path
+            "-vframes", "1", "-q:v", "3", "-vf", "scale=720:-1", out_path
         ], capture_output=True)
         if os.path.exists(out_path):
             with open(out_path, "rb") as f:
-                frames.append({
-                    "timestamp": round(t, 1),
-                    "base64": base64.b64encode(f.read()).decode()
-                })
+                frames.append({"timestamp": round(t, 1), "base64": base64.b64encode(f.read()).decode()})
     return frames, duration
 
 @app.post("/extract-frames")
@@ -50,11 +41,7 @@ async def api_extract_frames(video: UploadFile = File(...)):
     with open(video_path, "wb") as f:
         f.write(await video.read())
     frames, duration = extract_frames(video_path, f"{out_dir}/frames")
-    return {
-        "job_id": job_id,
-        "duration": duration,
-        "frames": frames
-    }
+    return {"job_id": job_id, "duration": duration, "frames": frames}
 
 @app.post("/analyze-url")
 async def analyze_url(url: str = Form(...)):
@@ -70,14 +57,8 @@ async def analyze_url(url: str = Form(...)):
         ], capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             return JSONResponse({"error": result.stderr[-300:]}, status_code=400)
-        video_path = f"{out_dir}/video.mp4"
-        frames, duration = extract_frames(video_path, f"{out_dir}/frames")
-        return {
-            "job_id": job_id,
-            "duration": duration,
-            "frames": frames,
-            "status": "ready"
-        }
+        frames, duration = extract_frames(f"{out_dir}/video.mp4", f"{out_dir}/frames")
+        return {"job_id": job_id, "duration": duration, "frames": frames, "status": "ready"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -97,67 +78,74 @@ async def create_video(
     duration_per_image = style_data.get("duration_per_image", 3)
     output_path = f"{out_dir}/output.mp4"
 
-    input_args = []
-    filter_parts = []
-    idx = 0
-
-    # Xử lý ảnh
+    # Lưu file trước
+    img_paths = []
     for i, img in enumerate(images):
         path = f"{out_dir}/img_{i:03d}.jpg"
+        content = await img.read()
+        if len(content) == 0:
+            continue
         with open(path, "wb") as f:
-            f.write(await img.read())
-        input_args += ["-loop", "1", "-t", str(duration_per_image), "-i", path]
-        filter_parts.append(
-            f"[{idx}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[v{idx}]"
-        )
-        idx += 1
+            f.write(content)
+        img_paths.append(path)
 
-    # Xử lý video clips
+    vid_paths = []
     for i, vid in enumerate(videos):
         path = f"{out_dir}/vid_{i:03d}.mp4"
+        content = await vid.read()
+        if len(content) == 0:
+            continue
         with open(path, "wb") as f:
-            f.write(await vid.read())
+            f.write(content)
+        vid_paths.append(path)
 
-        trim_start = plan_data.get("trimStart", 0)
-        trim_end = plan_data.get("trimEnd", 0)
+    if not img_paths and not vid_paths:
+        return JSONResponse({"error": "Không có ảnh hoặc video hợp lệ"}, status_code=400)
 
-        # Trim nếu có trong edit plan
-        trimmed = f"{out_dir}/vid_{i:03d}_trim.mp4"
-        trim_cmd = ["ffmpeg", "-y"]
-        if trim_start > 0:
-            trim_cmd += ["-ss", str(trim_start)]
-        trim_cmd += ["-i", path]
-        if trim_end > 0:
-            trim_cmd += ["-t", str(trim_end - trim_start)]
-        trim_cmd += ["-c", "copy", trimmed]
-        subprocess.run(trim_cmd, capture_output=True)
+    # Tạo file list cho concat
+    inputs = []
+    concat_list_path = f"{out_dir}/concat.txt"
 
-        src = trimmed if os.path.exists(trimmed) else path
-        input_args += ["-i", src]
-        filter_parts.append(
-            f"[{idx}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{idx}]"
-        )
-        idx += 1
+    for path in img_paths:
+        # Convert ảnh → video clip ngắn
+        clip_path = f"{path}_clip.mp4"
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", path,
+            "-t", str(duration_per_image),
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            clip_path
+        ], capture_output=True, timeout=60)
+        if os.path.exists(clip_path):
+            inputs.append(clip_path)
 
-    if idx == 0:
-        return JSONResponse({"error": "Không có ảnh hoặc video"}, status_code=400)
+    for path in vid_paths:
+        clip_path = f"{path}_clip.mp4"
+        subprocess.run([
+            "ffmpeg", "-y", "-i", path,
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            clip_path
+        ], capture_output=True, timeout=120)
+        if os.path.exists(clip_path):
+            inputs.append(clip_path)
 
-    concat_in = "".join([f"[v{i}]" for i in range(idx)])
-    filter_complex = ";".join(filter_parts) + f";{concat_in}concat=n={idx}:v=1:a=0[outv]"
+    if not inputs:
+        return JSONResponse({"error": "Không tạo được clip từ media"}, status_code=500)
 
-    cmd = [
-        "ffmpeg", "-y",
-        *input_args,
-        "-filter_complex", filter_complex,
-        "-map", "[outv]",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-r", "30", output_path
-    ]
+    # Concat tất cả clips
+    with open(concat_list_path, "w") as f:
+        for p in inputs:
+            f.write(f"file '{p}'\n")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if result.returncode != 0:
+    result = subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_list_path,
+        "-c", "copy", output_path
+    ], capture_output=True, text=True, timeout=300)
+
+    if result.returncode != 0 or not os.path.exists(output_path):
         return JSONResponse({"error": result.stderr[-500:]}, status_code=500)
 
     return {"job_id": job_id, "status": "done", "download_url": f"/download/{job_id}"}
@@ -170,43 +158,33 @@ async def edit_video(
     job_id = str(uuid.uuid4())[:8]
     out_dir = f"{WORK_DIR}/{job_id}"
     os.makedirs(out_dir, exist_ok=True)
-
     plan = json.loads(edit_plan)
     input_path = f"{out_dir}/input.mp4"
     output_path = f"{out_dir}/output.mp4"
-
     with open(input_path, "wb") as f:
         f.write(await video.read())
-
     trim_start = plan.get("trimStart", 0)
     trim_end = plan.get("trimEnd", 0)
     speed = plan.get("speed", 1.0)
     brightness = plan.get("brightness", 1.0)
     contrast = plan.get("contrast", 1.0)
-
-    vf_filters = []
-    vf_filters.append(f"scale=1080:1920:force_original_aspect_ratio=decrease")
-    vf_filters.append(f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2")
-    vf_filters.append(f"eq=brightness={brightness-1:.2f}:contrast={contrast:.2f}")
+    vf_filters = [
+        "scale=1080:1920:force_original_aspect_ratio=decrease",
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+        f"eq=brightness={brightness-1:.2f}:contrast={contrast:.2f}"
+    ]
     if speed != 1.0:
         vf_filters.append(f"setpts={1/speed:.2f}*PTS")
-
     cmd = ["ffmpeg", "-y"]
     if trim_start > 0:
         cmd += ["-ss", str(trim_start)]
     cmd += ["-i", input_path]
     if trim_end > trim_start:
         cmd += ["-t", str(trim_end - trim_start)]
-    cmd += [
-        "-vf", ",".join(vf_filters),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-r", "30", output_path
-    ]
-
+    cmd += ["-vf", ",".join(vf_filters), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", output_path]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         return JSONResponse({"error": result.stderr[-500:]}, status_code=500)
-
     return {"job_id": job_id, "status": "done", "download_url": f"/download/{job_id}"}
 
 @app.get("/download/{job_id}")
