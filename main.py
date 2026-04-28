@@ -8,6 +8,10 @@ WORK_DIR = "/tmp/nova_work"
 KNOWLEDGE_FILE = "/tmp/nova_knowledge.json"
 os.makedirs(WORK_DIR, exist_ok=True)
 
+# ═══════════════════════════════════
+# KNOWLEDGE STORE
+# ═══════════════════════════════════
+
 def load_knowledge() -> list:
     if os.path.exists(KNOWLEDGE_FILE):
         try:
@@ -30,6 +34,10 @@ def add_rule(rule: dict) -> str:
     rules.append(rule)
     save_knowledge_file(rules)
     return rule["id"]
+
+# ═══════════════════════════════════
+# FILTER ENGINE
+# ═══════════════════════════════════
 
 def sanitize_vf(vf_str: str) -> str:
     if not vf_str or not isinstance(vf_str, str):
@@ -107,6 +115,10 @@ def build_vf(ai_vf: str) -> str:
         parts.append(clean)
     return ",".join(parts)
 
+# ═══════════════════════════════════
+# FRAME + AUDIO EXTRACTION
+# ═══════════════════════════════════
+
 def extract_frames(video_path, out_dir, count=6):
     os.makedirs(out_dir, exist_ok=True)
     r = subprocess.run(
@@ -130,6 +142,26 @@ def extract_frames(video_path, out_dir, count=6):
             with open(out_path,"rb") as f:
                 frames.append({"timestamp":round(t,1),"base64":base64.b64encode(f.read()).decode()})
     return frames, duration
+
+def extract_audio(video_path, out_dir) -> str:
+    """Extract audio mp3 từ video, giới hạn 60s đầu để tiết kiệm"""
+    audio_path = f"{out_dir}/audio.mp3"
+    subprocess.run([
+        "ffmpeg","-y","-i",video_path,
+        "-t","60",          # chỉ lấy 60s đầu
+        "-vn",              # bỏ video
+        "-acodec","mp3",
+        "-ab","64k",        # bitrate thấp — đủ cho STT
+        "-ar","16000",      # 16kHz — chuẩn Whisper
+        audio_path
+    ], capture_output=True, timeout=60)
+    if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+        return audio_path
+    return ""
+
+# ═══════════════════════════════════
+# CLIP BUILDERS
+# ═══════════════════════════════════
 
 def make_image_clip(img_path, clip_path, vf_str, duration):
     vf = vf_str
@@ -169,11 +201,15 @@ def concat_clips(inputs, output_path, out_dir):
     ok = r.returncode == 0 and os.path.exists(output_path)
     return ok, r.stderr[-300:] if not ok else ""
 
+# ═══════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════
+
 @app.get("/")
 def root():
     rules = load_knowledge()
     return {
-        "status": "Nova Backend v4 Online",
+        "status": "Nova Backend v5 Online",
         "knowledge_count": len(rules),
         "tutorial_count": sum(1 for r in rules if r.get("type") == "tutorial"),
         "style_count": sum(1 for r in rules if r.get("type") == "style")
@@ -181,17 +217,34 @@ def root():
 
 @app.post("/extract-frames")
 async def api_extract_frames(video: UploadFile = File(...)):
+    """Extract frames + audio từ video local"""
     job_id = str(uuid.uuid4())[:8]
     out_dir = f"{WORK_DIR}/{job_id}"
     os.makedirs(out_dir, exist_ok=True)
     video_path = f"{out_dir}/input.mp4"
     with open(video_path,"wb") as f:
         f.write(await video.read())
+
     frames, duration = extract_frames(video_path, f"{out_dir}/frames")
-    return {"job_id":job_id,"duration":duration,"frames":frames}
+
+    # Extract audio cho Whisper STT
+    audio_path = extract_audio(video_path, out_dir)
+    audio_b64 = ""
+    if audio_path:
+        with open(audio_path,"rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode()
+
+    return {
+        "job_id": job_id,
+        "duration": duration,
+        "frames": frames,
+        "audio_b64": audio_b64,      # App gửi cho Groq Whisper
+        "has_audio": bool(audio_b64)
+    }
 
 @app.post("/analyze-url")
 async def analyze_url(url: str = Form(...)):
+    """Download video từ URL + extract frames + audio"""
     job_id = str(uuid.uuid4())[:8]
     out_dir = f"{WORK_DIR}/{job_id}"
     os.makedirs(out_dir, exist_ok=True)
@@ -204,8 +257,24 @@ async def analyze_url(url: str = Form(...)):
         ], capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             return JSONResponse({"error":result.stderr[-300:]}, status_code=400)
+
         frames, duration = extract_frames(f"{out_dir}/video.mp4", f"{out_dir}/frames")
-        return {"job_id":job_id,"duration":duration,"frames":frames,"status":"ready"}
+
+        # Extract audio cho Whisper STT
+        audio_path = extract_audio(f"{out_dir}/video.mp4", out_dir)
+        audio_b64 = ""
+        if audio_path:
+            with open(audio_path,"rb") as f:
+                audio_b64 = base64.b64encode(f.read()).decode()
+
+        return {
+            "job_id": job_id,
+            "duration": duration,
+            "frames": frames,
+            "audio_b64": audio_b64,
+            "has_audio": bool(audio_b64),
+            "status": "ready"
+        }
     except Exception as e:
         return JSONResponse({"error":str(e)}, status_code=500)
 
