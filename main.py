@@ -47,8 +47,8 @@ async def analyze_url(url: str = Form(...)):
     try:
         result = subprocess.run([
             "yt-dlp","--no-playlist",
-            "-f","bestvideo[height<=480]+bestaudio/best[height<=480]",
-            "--merge-output-format","mp4",
+            "-f","best[height<=720]/best",
+            "--no-check-certificate",
             "-o",f"{out_dir}/video.mp4", url
         ], capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
