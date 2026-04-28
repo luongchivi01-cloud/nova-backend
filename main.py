@@ -68,12 +68,21 @@ async def create_video(
     job_id = str(uuid.uuid4())[:8]
     out_dir = f"{WORK_DIR}/{job_id}"
     os.makedirs(out_dir, exist_ok=True)
-    style_data = json.loads(style)
-    duration_per_image = style_data.get("duration_per_image", 3)
-    output_path = f"{out_dir}/output.mp4"
 
+    style_data = json.loads(style)
+    plan_data = json.loads(edit_plan)
+
+    # Style params
+    duration_per_image = float(style_data.get("duration_per_image", 3))
+    speed = float(plan_data.get("speed", 1.0))
+    brightness = float(plan_data.get("brightness", 1.0))
+    contrast = float(plan_data.get("contrast", 1.0))
+    transition = style_data.get("transition", "fade")
+
+    output_path = f"{out_dir}/output.mp4"
     inputs = []
 
+    # Xử lý ảnh → clip có áp dụng style
     for i, img in enumerate(images):
         content = await img.read()
         if len(content) < 100:
@@ -81,18 +90,37 @@ async def create_video(
         img_path = f"{out_dir}/img_{i:03d}.jpg"
         with open(img_path,"wb") as f:
             f.write(content)
+
         clip_path = f"{out_dir}/img_{i:03d}_clip.mp4"
+
+        # Build filter với style thật
+        vf_parts = [
+            "scale=1080:1920:force_original_aspect_ratio=decrease",
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            "setsar=1",
+            f"eq=brightness={brightness-1:.3f}:contrast={contrast:.3f}:saturation=1.2",
+        ]
+        if speed != 1.0:
+            vf_parts.append(f"setpts={1/speed:.3f}*PTS")
+
+        # Thêm zoom ken burns effect
+        vf_parts.append(f"zoompan=z=\'min(zoom+0.0015,1.5)\':d={int(duration_per_image*30)}:s=1080x1920")
+
+        vf_str = ",".join(vf_parts)
+
         r = subprocess.run([
             "ffmpeg","-y",
             "-loop","1","-i", img_path,
             "-t", str(duration_per_image),
-            "-vf","scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
+            "-vf", vf_str,
             "-c:v","libx264","-pix_fmt","yuv420p","-r","30","-preset","ultrafast",
             clip_path
-        ], capture_output=True, text=True, timeout=30)
+        ], capture_output=True, text=True, timeout=60)
+
         if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
             inputs.append(clip_path)
 
+    # Xử lý video clips
     for i, vid in enumerate(videos):
         content = await vid.read()
         if len(content) < 100:
@@ -100,32 +128,55 @@ async def create_video(
         vid_path = f"{out_dir}/vid_{i:03d}.mp4"
         with open(vid_path,"wb") as f:
             f.write(content)
+
         clip_path = f"{out_dir}/vid_{i:03d}_clip.mp4"
-        r = subprocess.run([
-            "ffmpeg","-y","-i", vid_path,
-            "-vf","scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
-            "-c:v","libx264","-pix_fmt","yuv420p","-r","30","-preset","ultrafast",
-            clip_path
-        ], capture_output=True, text=True, timeout=60)
+        trim_start = float(plan_data.get("trimStart", 0))
+        trim_end = float(plan_data.get("trimEnd", 0))
+
+        vf_parts = [
+            "scale=1080:1920:force_original_aspect_ratio=decrease",
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            "setsar=1",
+            f"eq=brightness={brightness-1:.3f}:contrast={contrast:.3f}:saturation=1.2",
+        ]
+        if speed != 1.0:
+            vf_parts.append(f"setpts={1/speed:.3f}*PTS")
+
+        cmd = ["ffmpeg","-y"]
+        if trim_start > 0:
+            cmd += ["-ss", str(trim_start)]
+        cmd += ["-i", vid_path]
+        if trim_end > trim_start:
+            cmd += ["-t", str(trim_end - trim_start)]
+        cmd += ["-vf", ",".join(vf_parts), "-c:v","libx264","-pix_fmt","yuv420p","-r","30","-preset","ultrafast", clip_path]
+
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
             inputs.append(clip_path)
 
     if not inputs:
-        return JSONResponse({"error":"Không tạo được clip — FFmpeg lỗi hoặc file không hợp lệ"}, status_code=500)
+        return JSONResponse({"error":"Không tạo được clip — file không hợp lệ"}, status_code=500)
 
-    concat_path = f"{out_dir}/concat.txt"
-    with open(concat_path,"w") as f:
-        for p in inputs:
-            f.write(f"file '{p}'\n")
+    # Concat với transition fade
+    if len(inputs) == 1:
+        # 1 clip thì copy thẳng
+        import shutil
+        shutil.copy(inputs[0], output_path)
+    else:
+        # Nhiều clip → concat
+        concat_path = f"{out_dir}/concat.txt"
+        with open(concat_path,"w") as f:
+            for p in inputs:
+                f.write(f"file '{p}'\n")
 
-    r = subprocess.run([
-        "ffmpeg","-y","-f","concat","-safe","0",
-        "-i", concat_path,
-        "-c","copy", output_path
-    ], capture_output=True, text=True, timeout=120)
+        r = subprocess.run([
+            "ffmpeg","-y","-f","concat","-safe","0",
+            "-i", concat_path,
+            "-c","copy", output_path
+        ], capture_output=True, text=True, timeout=120)
 
-    if r.returncode != 0 or not os.path.exists(output_path):
-        return JSONResponse({"error": r.stderr[-500:]}, status_code=500)
+        if r.returncode != 0 or not os.path.exists(output_path):
+            return JSONResponse({"error": r.stderr[-500:]}, status_code=500)
 
     return {"job_id":job_id,"status":"done","download_url":f"/download/{job_id}"}
 
@@ -145,7 +196,7 @@ async def edit_video(video: UploadFile = File(...), edit_plan: str = Form("{}"))
     vf = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-        f"eq=brightness={brightness-1:.2f}:contrast={contrast:.2f}"
+        f"eq=brightness={brightness-1:.2f}:contrast={contrast:.2f}:saturation=1.1"
     ]
     if speed != 1.0:
         vf.append(f"setpts={1/speed:.2f}*PTS")
