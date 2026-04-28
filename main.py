@@ -117,7 +117,7 @@ async def create_video(
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
             clip_path
         ], capture_output=True, timeout=60)
-        if os.path.exists(clip_path):
+        if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
             inputs.append(clip_path)
 
     for path in vid_paths:
@@ -128,7 +128,7 @@ async def create_video(
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
             clip_path
         ], capture_output=True, timeout=120)
-        if os.path.exists(clip_path):
+        if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
             inputs.append(clip_path)
 
     if not inputs:
