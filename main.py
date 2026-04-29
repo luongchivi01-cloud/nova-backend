@@ -48,6 +48,35 @@ def sanitize_vf(vf_str: str) -> str:
         return ""
     return vf_str.strip()
 
+def render_timeline(timeline: list, duration: float, out_dir: str, base_vf: str) -> list:
+    """
+    Nhận timeline JSON từ Gemini → render từng segment → trả list clip paths.
+    Gemini viết filter gì → chạy filter đó. Không hardcode.
+    """
+    clips = []
+    for i, seg in enumerate(timeline):
+        t_start = float(seg.get("time_start", 0))
+        t_end   = float(seg.get("time_end", t_start + 3))
+        seg_dur = max(t_end - t_start, 0.5)
+        raw_filter = seg.get("ffmpeg_filter") or ""
+        clean_filter = sanitize_vf(raw_filter)
+        # Dùng filter của segment nếu có, fallback về base_vf
+        vf = clean_filter if clean_filter else base_vf
+        clip_path = f"{out_dir}/tl_{i:03d}.mp4"
+        # Tạo clip màu đen có filter (placeholder visual)
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=black:s=1080x1920:d={seg_dur}",
+            "-vf", vf,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            "-preset", "ultrafast", clip_path
+        ]
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        if os.path.exists(clip_path) and os.path.getsize(clip_path) > 100:
+            clips.append(clip_path)
+    return clips
+
+
 def compose_filter(rules: list, prompt: str = "") -> dict:
     if not rules:
         return {
@@ -335,15 +364,23 @@ async def create_video(
     os.makedirs(out_dir, exist_ok=True)
     style_data = json.loads(style)
     plan_data  = json.loads(edit_plan)
-    ai_vf = sanitize_vf(plan_data.get("ffmpeg_vf","") or style_data.get("ffmpeg_vf",""))
+
+    # Ưu tiên: edit_plan.ffmpeg_vf > style.ffmpeg_vf > compose từ knowledge
+    ai_vf = sanitize_vf(
+        plan_data.get("ffmpeg_vf","") or style_data.get("ffmpeg_vf","")
+    )
     if not ai_vf:
         rules = load_knowledge()
         if rules:
             ai_vf = compose_filter(rules).get("ffmpeg_vf","")
+
     dur = float(style_data.get("duration_per_image", plan_data.get("duration_per_clip", 3)))
     ts  = float(plan_data.get("trimStart", 0))
     te  = float(plan_data.get("trimEnd", 0))
     vf_str = build_vf(ai_vf)
+
+    # Log filter đang dùng để debug
+    print(f"[create-video] filter: {ai_vf or '(default)'}")
     output_path = f"{out_dir}/output.mp4"
     inputs = []
     for i, img in enumerate(images):
@@ -367,7 +404,13 @@ async def create_video(
     ok, err = concat_clips(inputs, output_path, out_dir)
     if not ok:
         return JSONResponse({"error":err}, status_code=500)
-    return {"job_id":job_id,"status":"done","download_url":f"/download/{job_id}","filter_used":ai_vf}
+    return {
+        "job_id": job_id,
+        "status": "done",
+        "download_url": f"/download/{job_id}",
+        "filter_used": ai_vf,
+        "clips_count": len(inputs),
+    }
 
 @app.post("/edit-video")
 async def edit_video(video: UploadFile = File(...), edit_plan: str = Form("{}")):
@@ -460,6 +503,50 @@ async def smart_edit(
         "tutorial_steps": compose_info.get("tutorial_steps",[]),
         "sources":        compose_info.get("sources",[])
     }
+
+@app.post("/compare")
+async def compare_videos(
+    tutorial: UploadFile = File(None),
+    generated: UploadFile = File(None),
+    tutorial_url: str = Form(""),
+    generated_url: str = Form(""),
+):
+    """Extract frames từ cả 2 video, trả về để app gửi Gemini so sánh"""
+    job_id = str(uuid.uuid4())[:8]
+    out_dir = f"{WORK_DIR}/{job_id}"
+    os.makedirs(out_dir, exist_ok=True)
+    result = {"job_id": job_id}
+
+    # Tutorial video
+    if tutorial and tutorial.filename:
+        t_path = f"{out_dir}/tutorial.mp4"
+        with open(t_path, "wb") as f:
+            f.write(await tutorial.read())
+        frames, dur = extract_frames(t_path, f"{out_dir}/t_frames")
+        result["tutorial_frames"] = frames
+        result["tutorial_duration"] = dur
+    elif tutorial_url:
+        sub = subprocess.run(
+            ["yt-dlp","--no-playlist","-f","best[height<=480]/best",
+             "-o", f"{out_dir}/tutorial.mp4", tutorial_url],
+            capture_output=True, timeout=120
+        )
+        if sub.returncode == 0:
+            frames, dur = extract_frames(f"{out_dir}/tutorial.mp4", f"{out_dir}/t_frames")
+            result["tutorial_frames"] = frames
+            result["tutorial_duration"] = dur
+
+    # Generated video
+    if generated and generated.filename:
+        g_path = f"{out_dir}/generated.mp4"
+        with open(g_path, "wb") as f:
+            f.write(await generated.read())
+        frames, dur = extract_frames(g_path, f"{out_dir}/g_frames")
+        result["generated_frames"] = frames
+        result["generated_duration"] = dur
+
+    return result
+
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
