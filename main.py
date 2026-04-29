@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
-import subprocess, uuid, os, json, base64, re, shutil
+import subprocess, uuid, os, json, base64, re, shutil, struct, wave
 from datetime import datetime
 
 app = FastAPI()
@@ -189,6 +189,239 @@ def extract_audio(video_path, out_dir) -> str:
     return ""
 
 # ═══════════════════════════════════
+# SMART ANALYSIS (FREE TIER)
+# ═══════════════════════════════════
+
+def detect_scene_changes(video_path: str, threshold: float = 0.35) -> list:
+    """
+    Dùng FFmpeg scene change detection — hoàn toàn free.
+    Trả về list timestamp (giây) tại điểm cắt thật.
+    """
+    r = subprocess.run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", f"select='gt(scene,{threshold})',showinfo",
+        "-vsync", "vfr", "-f", "null", "-"
+    ], capture_output=True, text=True, timeout=120)
+
+    timestamps = []
+    for line in r.stderr.splitlines():
+        if 'pts_time:' in line:
+            try:
+                t = float(line.split('pts_time:')[1].split()[0])
+                timestamps.append(round(t, 2))
+            except:
+                pass
+    # Luôn có điểm đầu
+    if not timestamps or timestamps[0] > 0.5:
+        timestamps.insert(0, 0.0)
+    return sorted(set(timestamps))
+
+
+def extract_smart_frames(video_path: str, out_dir: str, max_frames: int = 12) -> tuple:
+    """
+    Kết hợp: scene change frames + đều nhau.
+    Tối đa max_frames để không spam Gemini.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Lấy duration
+    r = subprocess.run(
+        ["ffprobe","-v","error","-show_entries","format=duration","-of","json", video_path],
+        capture_output=True, text=True
+    )
+    try:
+        duration = float(json.loads(r.stdout)["format"]["duration"])
+    except:
+        duration = 30.0
+
+    # Scene change timestamps
+    scene_ts = detect_scene_changes(video_path)
+
+    # Đều nhau timestamps
+    even_count = max(3, max_frames - len(scene_ts))
+    interval = duration / (even_count + 1)
+    even_ts = [round(interval * i, 2) for i in range(1, even_count + 1)]
+
+    # Merge + deduplicate (không trùng trong vòng 0.5s)
+    all_ts = sorted(set(scene_ts + even_ts))
+    merged = []
+    for t in all_ts:
+        if not merged or t - merged[-1] > 0.5:
+            merged.append(t)
+
+    # Giới hạn max_frames
+    if len(merged) > max_frames:
+        # Ưu tiên scene change
+        sc_set = set(scene_ts)
+        priority = [t for t in merged if t in sc_set]
+        others   = [t for t in merged if t not in sc_set]
+        merged   = (priority + others)[:max_frames]
+        merged   = sorted(merged)
+
+    frames = []
+    for i, t in enumerate(merged):
+        if t >= duration:
+            continue
+        out_path = f"{out_dir}/smart_{i:02d}.jpg"
+        subprocess.run([
+            "ffmpeg","-y","-ss",str(t),"-i",video_path,
+            "-vframes","1","-q:v","3","-vf","scale=720:-1", out_path
+        ], capture_output=True, timeout=15)
+        if os.path.exists(out_path):
+            with open(out_path,"rb") as f:
+                frames.append({
+                    "timestamp": t,
+                    "base64": base64.b64encode(f.read()).decode(),
+                    "is_scene_change": t in set(scene_ts),
+                })
+
+    return frames, duration
+
+
+def detect_beats(audio_path: str) -> dict:
+    """
+    Beat detection không cần librosa — dùng FFmpeg volumedetect + silencedetect.
+    Phát hiện: BPM ước tính, energy peaks, silence gaps.
+    Hoàn toàn free, không cần pip install.
+    """
+    result = {"bpm_estimate": 0, "beat_timestamps": [], "energy": "medium", "has_music": False}
+
+    if not audio_path or not os.path.exists(audio_path):
+        return result
+
+    # Volume analysis
+    r = subprocess.run([
+        "ffmpeg", "-i", audio_path,
+        "-af", "volumedetect", "-f", "null", "-"
+    ], capture_output=True, text=True, timeout=30)
+
+    mean_vol = -91.0
+    max_vol  = -91.0
+    for line in r.stderr.splitlines():
+        if 'mean_volume:' in line:
+            try: mean_vol = float(line.split('mean_volume:')[1].split('dB')[0].strip())
+            except: pass
+        if 'max_volume:' in line:
+            try: max_vol = float(line.split('max_volume:')[1].split('dB')[0].strip())
+            except: pass
+
+    result["mean_volume_db"] = mean_vol
+    result["max_volume_db"]  = max_vol
+
+    if mean_vol > -30:
+        result["energy"] = "high"
+        result["has_music"] = True
+    elif mean_vol > -45:
+        result["energy"] = "medium"
+        result["has_music"] = True
+    else:
+        result["energy"] = "low"
+
+    # Silence detection → ước tính nhịp
+    r2 = subprocess.run([
+        "ffmpeg", "-i", audio_path,
+        "-af", "silencedetect=noise=-40dB:d=0.1",
+        "-f", "null", "-"
+    ], capture_output=True, text=True, timeout=30)
+
+    silence_ends = []
+    for line in r2.stderr.splitlines():
+        if 'silence_end:' in line:
+            try:
+                t = float(line.split('silence_end:')[1].strip().split()[0])
+                silence_ends.append(round(t, 2))
+            except: pass
+
+    if len(silence_ends) >= 2:
+        gaps = [silence_ends[i+1] - silence_ends[i] for i in range(len(silence_ends)-1)]
+        avg_gap = sum(gaps) / len(gaps)
+        if 0.3 < avg_gap < 2.0:
+            result["bpm_estimate"] = round(60 / avg_gap)
+            result["beat_timestamps"] = silence_ends[:20]
+
+    return result
+
+
+def analyze_color(video_path: str, out_dir: str) -> dict:
+    """
+    Color analysis kỹ thuật thuần — FFmpeg histogram.
+    Không cần AI đoán màu. Trả về màu dominant thật + grade suggestion.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    thumb = f"{out_dir}/color_thumb.png"
+
+    # Extract 1 frame đại diện (giữa video)
+    r = subprocess.run(
+        ["ffprobe","-v","error","-show_entries","format=duration","-of","json", video_path],
+        capture_output=True, text=True
+    )
+    try:
+        dur = float(json.loads(r.stdout)["format"]["duration"])
+        mid = dur / 2
+    except:
+        mid = 5.0
+
+    subprocess.run([
+        "ffmpeg","-y","-ss",str(mid),"-i",video_path,
+        "-vframes","1","-vf","scale=160:90",thumb
+    ], capture_output=True, timeout=15)
+
+    # Dùng FFmpeg signalstats để lấy Y/U/V trung bình
+    r2 = subprocess.run([
+        "ffmpeg","-y","-ss",str(mid),"-i",video_path,
+        "-vframes","30",
+        "-vf","signalstats",
+        "-f","null","-"
+    ], capture_output=True, text=True, timeout=20)
+
+    yuv = {"y": 128, "u": 128, "v": 128}
+    for line in r2.stderr.splitlines():
+        if 'YAVG' in line:
+            try: yuv["y"] = float(line.split('YAVG:')[1].split()[0])
+            except: pass
+        if 'UAVG' in line:
+            try: yuv["u"] = float(line.split('UAVG:')[1].split()[0])
+            except: pass
+        if 'VAVG' in line:
+            try: yuv["v"] = float(line.split('VAVG:')[1].split()[0])
+            except: pass
+
+    # Phân tích từ YUV → tạo ffmpeg filter phù hợp
+    brightness = (yuv["y"] - 128) / 128  # -1 to 1
+    warmth = (yuv["v"] - 128) / 128      # + = warm/orange, - = cool/blue
+    saturation_hint = abs(yuv["u"] - 128) + abs(yuv["v"] - 128)
+
+    # Đề xuất filter để MATCH màu gốc
+    b_val = round(-brightness * 0.3, 3)   # bù brightness
+    c_val = round(1.0 + abs(brightness) * 0.2, 2)
+    s_val = round(1.0 + (saturation_hint / 100) * 0.5, 2)
+
+    # Color channel mixer cho warmth/cool tone
+    if warmth > 0.1:
+        tone = "warm"
+        cmx = f"colorchannelmixer=rr=1.05:gg=0.98:bb=0.9"
+    elif warmth < -0.1:
+        tone = "cool"
+        cmx = f"colorchannelmixer=rr=0.9:gg=0.98:bb=1.05"
+    else:
+        tone = "neutral"
+        cmx = ""
+
+    eq_filter = f"eq=brightness={b_val}:contrast={c_val}:saturation={s_val}"
+    full_filter = f"{eq_filter},{cmx}" if cmx else eq_filter
+
+    return {
+        "yuv": yuv,
+        "brightness_level": round(brightness, 3),
+        "warmth": round(warmth, 3),
+        "tone": tone,
+        "saturation_level": round(saturation_hint, 1),
+        "suggested_ffmpeg_vf": full_filter,
+        "reasoning": f"Y={yuv['y']:.0f}(bright={brightness:.2f}) U={yuv['u']:.0f} V={yuv['v']:.0f}(warm={warmth:.2f}) → {tone} tone"
+    }
+
+
+# ═══════════════════════════════════
 # CLIP BUILDERS
 # ═══════════════════════════════════
 
@@ -254,21 +487,36 @@ async def api_extract_frames(video: UploadFile = File(...)):
     with open(video_path,"wb") as f:
         f.write(await video.read())
 
-    frames, duration = extract_frames(video_path, f"{out_dir}/frames")
+    # Smart frames: scene change + đều nhau (tối đa 12)
+    frames, duration = extract_smart_frames(video_path, f"{out_dir}/frames", max_frames=12)
 
-    # Extract audio cho Whisper STT
+    # Color analysis kỹ thuật thuần
+    color_info = analyze_color(video_path, out_dir)
+
+    # Extract audio
     audio_path = extract_audio(video_path, out_dir)
     audio_b64 = ""
     if audio_path:
         with open(audio_path,"rb") as f:
             audio_b64 = base64.b64encode(f.read()).decode()
 
+    # Beat detection
+    beat_info = detect_beats(audio_path) if audio_path else {}
+
+    # Scene change timestamps (để app biết)
+    scene_timestamps = [f["timestamp"] for f in frames if f.get("is_scene_change")]
+
     return {
         "job_id": job_id,
         "duration": duration,
         "frames": frames,
-        "audio_b64": audio_b64,      # App gửi cho Groq Whisper
-        "has_audio": bool(audio_b64)
+        "audio_b64": audio_b64,
+        "has_audio": bool(audio_b64),
+        "scene_changes": scene_timestamps,
+        "scene_count": len(scene_timestamps),
+        "color_analysis": color_info,
+        "beat_info": beat_info,
+        "smart_ffmpeg_vf": color_info.get("suggested_ffmpeg_vf",""),
     }
 
 @app.post("/analyze-url")
@@ -287,14 +535,17 @@ async def analyze_url(url: str = Form(...)):
         if result.returncode != 0:
             return JSONResponse({"error":result.stderr[-300:]}, status_code=400)
 
-        frames, duration = extract_frames(f"{out_dir}/video.mp4", f"{out_dir}/frames")
+        frames, duration = extract_smart_frames(f"{out_dir}/video.mp4", f"{out_dir}/frames", max_frames=12)
 
-        # Extract audio cho Whisper STT
+        color_info = analyze_color(f"{out_dir}/video.mp4", out_dir)
         audio_path = extract_audio(f"{out_dir}/video.mp4", out_dir)
         audio_b64 = ""
         if audio_path:
             with open(audio_path,"rb") as f:
                 audio_b64 = base64.b64encode(f.read()).decode()
+
+        beat_info = detect_beats(audio_path) if audio_path else {}
+        scene_timestamps = [f["timestamp"] for f in frames if f.get("is_scene_change")]
 
         return {
             "job_id": job_id,
@@ -302,6 +553,11 @@ async def analyze_url(url: str = Form(...)):
             "frames": frames,
             "audio_b64": audio_b64,
             "has_audio": bool(audio_b64),
+            "scene_changes": scene_timestamps,
+            "scene_count": len(scene_timestamps),
+            "color_analysis": color_info,
+            "beat_info": beat_info,
+            "smart_ffmpeg_vf": color_info.get("suggested_ffmpeg_vf",""),
             "status": "ready"
         }
     except Exception as e:
